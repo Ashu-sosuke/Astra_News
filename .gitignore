@@ -1,0 +1,22 @@
+# Environments
+.env
+.venv/
+env/
+venv/
+ENV/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Data & Logs
+*.log
+seen_articles.json
+firebase_seen.json
+
+# Secrets
+*_service_account.json
+service_account.json
+credentials.json
+.firebase/
