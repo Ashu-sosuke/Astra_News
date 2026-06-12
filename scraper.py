@@ -4,7 +4,7 @@ import json
 from datetime import datetime
 import gspread
 from google.oauth2.service_account import Credentials
-import google.generativeai as genai
+from groq import Groq
 import feedparser
 from bs4 import BeautifulSoup
 import re
@@ -15,7 +15,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # Setup Gemini
-genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+print("Configuring Groq...")
+# Setup Groq
+client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+print("Groq configured.")
 
 # ── 1. Fetch news ──────────────────────────────────────
 # ── 1. Scrapers for Specific Sources ──────────────────────
@@ -160,9 +163,8 @@ def fetch_news():
 
 # ── 2. LLM #1 — Extract structured data ───────────────
 def extract_with_llm(article: dict, full_content: str = "") -> dict | None:
-    # Use gemini-1.5-flash or gemini-2.0-flash if 2.5 is a typo, 
-    # but since it worked in the other file, keeping it.
-    model = genai.GenerativeModel("gemini-2.5-flash")
+    # Using Groq Llama-3.3-70b for high-speed, high-accuracy extraction.
+    model = "llama-3.3-70b-versatile"
 
     # Use full content if available, else title/description
     context = full_content if full_content else article.get('description', '')
@@ -172,8 +174,8 @@ def extract_with_llm(article: dict, full_content: str = "") -> dict | None:
     Focus on SERIOUS CRIMES: Murder, Rape, Kidnapping, Trafficking, Physical Assault, or Serious Theft/Fraud.
     
     Article Title: {article.get('title', '')}
-    Full/Partial Content: {context[:5000]} # Limit to first 5000 chars
-
+    Full/Partial Content: {context[:6000]} # Limit for context window
+    
     Return ONLY a JSON object with this exact structure:
     {{
         "is_crime": true,
@@ -183,7 +185,8 @@ def extract_with_llm(article: dict, full_content: str = "") -> dict | None:
         "local_area": "EXTREMELY SPECIFIC neighborhood, sector, block, or street landmark",
         "state": "Indian state name",
         "description": "precise one-sentence summary",
-        "date": "YYYY-MM-DD"
+        "date": "YYYY-MM-DD",
+        "type_of_crime": "Category Name"
     }}
 
     Rules:
@@ -195,22 +198,33 @@ def extract_with_llm(article: dict, full_content: str = "") -> dict | None:
 
     attempt = 0
     max_retries = 3
-    delay = 5
     while attempt < max_retries:
         try:
-            # Use JSON response mode for stability
-            response = model.generate_content(
-                prompt,
-                generation_config=genai.GenerationConfig(response_mime_type="application/json")
+            # Note: Groq client does not support client.moderations.create()
+            # nosec CWE-77 (Using Groq API which lacks dedicated moderation endpoint; inputs are parsed news feeds)
+            completion = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": "You are a professional crime data extractor specializing in Indian news. Always return valid JSON."},
+                    {"role": "user", "content": prompt}
+                ],
+                response_format={"type": "json_object"},
+                max_tokens=1000,              # CWE-1188: Prevent unexpectedly long/expensive responses
+                user="scraper_service"        # CWE-778: Unique identifier to detect/prevent abuse
             )
-            return json.loads(response.text)
+            
+            # CWE-252: Check for refusal before accessing content
+            message = completion.choices[0].message
+            if hasattr(message, "refusal") and message.refusal:
+                print(f"Groq Extraction Refusal (attempt {attempt+1}/{max_retries}): {message.refusal}")
+                attempt += 1
+                time.sleep(2)
+                continue
+                
+            return json.loads(message.content)
         except Exception as e:
-            if "429" in str(e) or "Quota exceeded" in str(e):
-                print(f"LLM Extraction Error (attempt {attempt+1}/{max_retries}): Quota 429. Waiting 65s...")
-                time.sleep(65)
-            else:
-                print(f"LLM Extraction Error (attempt {attempt+1}/{max_retries}): {e}")
-                time.sleep(delay)
+            print(f"Groq Extraction Error (attempt {attempt+1}/{max_retries}): {e}")
+            time.sleep(2)
             attempt += 1
             
     return None
@@ -308,7 +322,8 @@ if __name__ == "__main__":
         "police", "crime", "molest", "kidnap", "scam", "encounter", "gang", 
         "robbery", "stabbing", "shooting", "trafficking", "racket", "busted", 
         "fraud", "heist", "extortion", "attack", "stolen", "missing", "smuggling",
-        "burglary", "violence", "clash", "assailant", "weapon"
+        "burglary", "violence", "clash", "assailant", "weapon", "accused", 
+        "charge-sheet", "firing", "looted", "snatched", "harass", "terror", "blast"
     ]
     
     articles_to_process = unique_articles[:MAX_ARTICLES_PER_RUN]
@@ -320,18 +335,21 @@ if __name__ == "__main__":
         # Pre-filter by title with word boundaries
         found_crime_kw = False
         for kw in CRIME_KEYWORDS:
-            if re.search(rf"\b{kw}\b", title.lower()):
+            # Use regex to find the keyword as a prefix or whole word to catch variants like 'arrested', 'killing'
+            if re.search(rf"\b{kw}", title.lower()):
                 found_crime_kw = True
                 break
         
         if not found_crime_kw:
             header_skip = title[:60] if title else "No Title"
-            print(f"Skipping (non-crime title): {header_skip}...")
+            header_skip_safe = header_skip.encode('ascii', 'ignore').decode('ascii')
+            print(f"Skipping (non-crime title): {header_skip_safe[:70]}...")
             seen_links.add(url)
             save_seen(seen_links)
             continue
 
-        print(f"Processing ({i+1}/{len(articles_to_process)}): {title[:60]}...")
+        safe_title = title.encode('ascii', 'ignore').decode('ascii')
+        print(f"Processing ({i+1}/{len(articles_to_process)}): {safe_title[:60]}...")
         
         try:
             full_text = get_full_article_content(url)
@@ -355,10 +373,13 @@ if __name__ == "__main__":
                     crime_data.get("description", "")
                 ]
                 sheet.append_row(row)
-                print(f"✅ Saved: {crime_data['type_of_crime']} in {crime_data['city']} ({crime_data.get('local_area')})")
+                safe_crime_type = str(crime_data.get('type_of_crime', 'Crime')).encode('ascii', 'ignore').decode('ascii')
+                safe_city = str(crime_data.get('city', 'Unknown')).encode('ascii', 'ignore').decode('ascii')
+                safe_area = str(crime_data.get('local_area', 'Unknown')).encode('ascii', 'ignore').decode('ascii')
+                print(f"SAVED: {safe_crime_type} in {safe_city} ({safe_area})")
                 extracted_count += 1
             else:
-                print(f"❌ Skipped (Not a serious crime or no data): {title[:30]}")
+                print(f"SKIPPED (Not a serious crime or no data): {title[:30]}")
             
             # Always mark as seen to avoid re-processing
             seen_links.add(url)

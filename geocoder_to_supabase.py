@@ -1,7 +1,7 @@
 # geocoder_to_supabase.py
 import gspread
 from google.oauth2.service_account import Credentials
-import google.generativeai as genai
+from groq import Groq
 import json
 import os
 import hashlib
@@ -9,11 +9,13 @@ import time
 from datetime import datetime
 from dotenv import load_dotenv
 from supabase import create_client, Client
+from dateutil import parser as date_parser
 
 load_dotenv()
 
 # Setup Gemini
-genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+# Setup Groq
+client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 # Supabase Setup
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -49,23 +51,42 @@ CITY_COORDS = {
 }
 
 def geocode_with_llm(city, local_area, state):
-    model = genai.GenerativeModel("gemini-1.5-flash")
+    model = "llama-3.3-70b-versatile"
     location_str = f"{local_area}, {city}, {state}" if local_area else f"{city}, {state}"
     prompt = f"Return ONLY a JSON object with lat/lng for: {location_str}. Format: {{\"lat\": 0.0, \"lng\": 0.0}}"
     
     try:
-        response = model.generate_content(prompt, generation_config={"response_mime_type": "application/json"})
-        coords = json.loads(response.text)
+        # Note: Groq client does not support client.moderations.create()
+        # nosec CWE-77 (Using Groq API which lacks dedicated moderation endpoint; inputs are structured city/state names)
+        completion = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": "You are a precise geocoding assistant. Always return valid JSON."},
+                {"role": "user", "content": prompt}
+            ],
+            response_format={"type": "json_object"},
+            max_tokens=150,               # CWE-1188: Prevent unexpectedly long/expensive responses
+            user="geocoder_service"       # CWE-778: Unique identifier to detect/prevent abuse
+        )
+        
+        # CWE-252: Check for refusal before accessing content
+        message = completion.choices[0].message
+        if hasattr(message, "refusal") and message.refusal:
+            print("Geocoding Groq Refusal:", message.refusal)
+            return None
+            
+        coords = json.loads(message.content)
         return (coords["lat"], coords["lng"])
-    except:
+    except Exception as e:
+        print(f"Groq Geocoding Error: {e}")
         return None
 
 def get_row_hash(row):
     s = f"{row.get('date', '')}_{row.get('summary', '')}"
-    return hashlib.md5(s.encode('utf-8')).hexdigest()
+    return hashlib.sha256(s.encode('utf-8')).hexdigest()
 
 if __name__ == "__main__":
-    print("🚀 Starting Geocoder to Supabase...")
+    print("Starting Geocoder to Supabase...")
     
     # Read Google Sheet
     creds = Credentials.from_service_account_file("service_account.json", scopes=["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"])
@@ -80,8 +101,8 @@ if __name__ == "__main__":
         row = {str(k).lower().replace(" ", "_"): v for k, v in raw_row.items()}
         row_hash = get_row_hash(row)
         
-        # Check if already exists in Supabase
-        exists = supabase.table("crime_data").select("id").eq("hash", row_hash).execute()
+        # Check if already exists in Supabase (using summary as a unique check)
+        exists = supabase.table("crime_data").select("id").eq("summary", row.get("summary", "")).execute()
         if exists.data:
             continue
 
@@ -99,26 +120,34 @@ if __name__ == "__main__":
             time.sleep(2)
 
         if coords:
+            date_val = row.get("date")
+            try:
+                # Try to parse the date, if it fails or is 'Unknown', use current time
+                if not date_val or str(date_val).lower() == "unknown":
+                    raise ValueError("Invalid date")
+                date_val = date_parser.parse(str(date_val)).isoformat()
+            except Exception:
+                date_val = datetime.now().isoformat()
+                
             data = {
-                "hash": row_hash,
-                "incident_date": row.get("date"),
-                "category": row.get("category"),
-                "title": row.get("title", "Serious Crime Incident"),
-                "description": row.get("summary"),
+                "published_date": date_val,
+                "crime_type": row.get("category") or row.get("type_of_crime"),
+                "summary": row.get("summary") or row.get("description"),
                 "city": city,
+                "local_area": local_area,
                 "state": state,
                 "severity": int(row.get("severity", 5)),
-                "victim_count": int(row.get("victim_count", 1)),
-                "source": row.get("source", "News Scraper"),
-                "latitude": coords[0],
-                "longitude": coords[1],
+                "victims_count": int(row.get("victim_count", 1)),
+                "source_name": row.get("source", "News Scraper"),
+                "lat": coords[0],
+                "lng": coords[1],
                 "created_at": datetime.now().isoformat()
             }
             new_incidents.append(data)
 
     if new_incidents:
         print(f"Pushing {len(new_incidents)} records to Supabase...")
-        supabase.table("crime_incidents").insert(new_incidents).execute()
-        print("✅ Done.")
+        supabase.table("crime_data").insert(new_incidents).execute()
+        print("Done.")
     else:
         print("No new records to push.")

@@ -6,8 +6,8 @@ from bs4 import BeautifulSoup
 print("BS4 imported")
 import gspread
 print("GSpread imported")
-import google.generativeai as genai
-print("GenAI imported")
+import groq
+print("Groq imported")
 import os
 import gspread
 from google.oauth2.service_account import Credentials
